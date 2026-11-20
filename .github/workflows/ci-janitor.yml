@@ -1,0 +1,36 @@
+# Deletes leftover build inputs: DRAFT releases with tag prefix "ci-" older than 3 hours (and a "ci-" tag if one exists).
+# Normal runs delete their draft themselves; this catches runs that never started or were skipped.
+# Note: GitHub disables scheduled workflows in public repos after 60 days without repository activity
+# (re-enable in Actions, or run it by hand).
+name: ci-janitor
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  janitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Delete stale ci- drafts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cutoff=$(date -u -d '3 hours ago' +%s)
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft and (.tag_name | test("^ci-[0-9a-f]{32}$"))) | "\(.id) \(.tag_name) \(.created_at)"' \
+          | while read -r id tag created; do
+              [[ "$id" =~ ^[0-9]+$ && "$tag" =~ ^ci-[0-9a-f]{32}$ ]] || continue
+              ts=$(date -u -d "$created" +%s)
+              if [ "$ts" -lt "$cutoff" ]; then
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" >/dev/null && echo "deleted draft $tag ($created)"
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" >/dev/null 2>&1 || true
+              fi
+            done
+          echo "janitor done"

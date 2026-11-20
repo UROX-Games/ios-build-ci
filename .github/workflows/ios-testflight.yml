@@ -1,0 +1,300 @@
+# Generic iOS build -> TestFlight for Unity projects (public repo, shared by several projects).
+#
+# Input: an exported Unity Xcode project, packed as tar.gz and AES-256 encrypted (openssl enc -aes-256-cbc -pbkdf2
+# -iter 200000 -md sha256), attached as the asset "xcode.tar.gz.enc" to a DRAFT release with a neutral tag ci-<32 hex>.
+# Drafts are visible only to users with write access. The build job downloads the asset and deletes the draft right away;
+# the cleanup job (always) and the ci-janitor workflow (every 6 h) remove anything left over.
+#
+# Public repo rules: workflow_dispatch only (no push / pull_request triggers, forks never get the secrets); only the repo
+# owner or users listed in the repo variable IOS_CI_ALLOWED_ACTORS (comma separated) may run it; no third-party actions;
+# inputs validated and passed through env; GH_TOKEN only in the steps that touch the release; no artifacts; on failure
+# the log shows only compiler/xcodebuild "error:" lines.
+#
+# Signing: the archive is built UNSIGNED (CODE_SIGNING_ALLOWED=NO) so build-phase scripts (CocoaPods, Unity, IL2CPP) never
+# see the App Store Connect key; signing + upload happen in xcodebuild -exportArchive with -allowProvisioningUpdates
+# (cloud signing). Fallback input sign_in_archive=true archives with automatic signing and the key present (proven path,
+# but then build-phase code could read the key file).
+#
+# Team-wide repository secrets (names only):
+#   APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8_B64 (AuthKey_<id>.p8 as base64 or raw), IOS_CI_ZIP_PASSWORD (>= 32 chars)
+name: ios-testflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'draft release tag holding xcode.tar.gz.enc (ci-<32 hex>)'
+        required: true
+        type: string
+      game:
+        description: 'project label (letters, digits, - _); also the concurrency group'
+        required: true
+        type: string
+      bundle_id:
+        description: 'expected bundle id (checked against the Xcode project)'
+        required: true
+        type: string
+      scheme:
+        description: 'Xcode scheme'
+        type: string
+        default: 'Unity-iPhone'
+      marketing_version:
+        description: 'CFBundleShortVersionString override (empty = keep)'
+        type: string
+        default: ''
+      build_number:
+        description: 'CFBundleVersion override (empty = <exported build>.<run number>)'
+        type: string
+        default: ''
+      upload:
+        description: 'true = upload to TestFlight, false = only archive + sign'
+        type: boolean
+        default: true
+      sign_in_archive:
+        description: 'fallback: sign already in the archive step (API key visible to build scripts)'
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  testflight:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.triggering_actor == github.repository_owner ||
+       contains(format(',{0},', vars.IOS_CI_ALLOWED_ACTORS), format(',{0},', github.triggering_actor)))
+    runs-on: macos-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write   # a draft release is visible only with write access; GH_TOKEN is exposed only to the download step
+    concurrency:
+      group: ios-${{ inputs.game }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash   # bash -eo pipefail, no xtrace
+    env:
+      IN_TAG: ${{ inputs.tag }}
+      IN_GAME: ${{ inputs.game }}
+      IN_BUNDLE: ${{ inputs.bundle_id }}
+      IN_SCHEME: ${{ inputs.scheme }}
+      IN_VERSION: ${{ inputs.marketing_version }}
+      IN_BUILD: ${{ inputs.build_number }}
+      SIGN_IN_ARCHIVE: ${{ inputs.sign_in_archive && 'true' || 'false' }}
+      DEST: ${{ inputs.upload && 'upload' || 'export' }}
+      PROJ: ${{ runner.temp }}/proj
+      ARCHIVE: ${{ runner.temp }}/out/App.xcarchive
+      EXPORT_DIR: ${{ runner.temp }}/out/export
+    steps:
+      - name: Validate inputs and secrets (names only)
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_B64: ${{ secrets.ASC_KEY_P8_B64 }}
+          IOS_CI_ZIP_PASSWORD: ${{ secrets.IOS_CI_ZIP_PASSWORD }}
+        run: |
+          set +x
+          [[ "$IN_TAG" =~ ^ci-[0-9a-f]{32}$ ]] || { echo "::error::invalid tag"; exit 1; }
+          [[ "$IN_GAME" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$ ]] || { echo "::error::invalid game"; exit 1; }
+          [[ "$IN_BUNDLE" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{2,154}$ ]] || { echo "::error::invalid bundle_id"; exit 1; }
+          [[ "$IN_SCHEME" =~ ^[A-Za-z0-9][A-Za-z0-9\ ._-]{0,79}$ ]] || { echo "::error::invalid scheme"; exit 1; }
+          [[ -z "$IN_VERSION" || "$IN_VERSION" =~ ^[0-9]{1,5}(\.[0-9]{1,5}){0,2}$ ]] || { echo "::error::invalid marketing_version"; exit 1; }
+          [[ -z "$IN_BUILD" || "$IN_BUILD" =~ ^[0-9]{1,9}(\.[0-9]{1,9}){0,2}$ ]] || { echo "::error::invalid build_number"; exit 1; }
+          miss=""
+          for n in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8_B64 IOS_CI_ZIP_PASSWORD; do [ -z "${!n}" ] && miss="$miss $n"; done
+          if [ -n "$miss" ]; then echo "::error::missing repository secrets:$miss"; exit 1; fi
+          [ ${#IOS_CI_ZIP_PASSWORD} -ge 32 ] || { echo "::error::IOS_CI_ZIP_PASSWORD must be at least 32 characters"; exit 1; }
+          [[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo "::error::APPLE_TEAM_ID must be 10 characters A-Z0-9"; exit 1; }
+          [[ "$ASC_KEY_ID" =~ ^[A-Z0-9]{8,12}$ ]] || { echo "::error::ASC_KEY_ID has an unexpected format"; exit 1; }
+          echo "destination $DEST, sign_in_archive $SIGN_IN_ARCHIVE"
+
+      - name: Select Xcode (latest stable /Applications/Xcode_*.app, >= 26)
+        run: |
+          v=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sed -E 's#^/Applications/Xcode_([0-9.]+)\.app$#\1#' \
+              | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+          [ -n "$v" ] || { echo "::error::no stable Xcode_*.app found"; exit 1; }
+          [ "${v%%.*}" -ge 26 ] || { echo "::error::newest Xcode is $v; App Store Connect needs 26+"; exit 1; }
+          sudo xcode-select -s "/Applications/Xcode_$v.app/Contents/Developer"
+          xcodebuild -version
+
+      - name: Download (draft only), delete the draft, decrypt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IOS_CI_ZIP_PASSWORD: ${{ secrets.IOS_CI_ZIP_PASSWORD }}
+        run: |
+          set +x
+          OSSL="$(brew --prefix openssl@3 2>/dev/null)/bin/openssl"
+          [ -x "$OSSL" ] || { brew install openssl@3 >/dev/null; OSSL="$(brew --prefix openssl@3)/bin/openssl"; }
+          draft=$(gh release view -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft -- "$IN_TAG")
+          [ "$draft" = "true" ] || { echo "::error::release is not a draft; refusing to use it"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/in" "$PROJ"
+          gh release download -R "$GITHUB_REPOSITORY" -p 'xcode.tar.gz.enc' -D "$RUNNER_TEMP/in" -- "$IN_TAG"
+          gh release delete -R "$GITHUB_REPOSITORY" -y -- "$IN_TAG" && echo "draft deleted" || echo "::warning::draft not deleted here (cleanup job will retry)"
+          "$OSSL" enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:IOS_CI_ZIP_PASSWORD \
+              -in "$RUNNER_TEMP/in/xcode.tar.gz.enc" | tar -xzf - -C "$PROJ" \
+            || { echo "::error::decrypt/unpack failed (wrong IOS_CI_ZIP_PASSWORD or damaged upload)"; exit 1; }
+          rm -rf "$RUNNER_TEMP/in"
+          test -d "$PROJ/Unity-iPhone.xcodeproj" || { echo "::error::Unity-iPhone.xcodeproj not found in the package"; exit 1; }
+
+      - name: Fix files exported on Windows (exec bits, CRLF in scripts)
+        working-directory: ${{ runner.temp }}/proj
+        run: |
+          find . -type f \( -name '*.sh' -o -name '*.pl' -o -name '*.py' \) -print0 | while IFS= read -r -d '' f; do
+            chmod +x "$f"; sed -i '' $'s/\r$//' "$f"
+          done
+          for f in usymtool usymtoolarm64; do if [ -f "$f" ]; then chmod +x "$f"; fi; done
+          if [ -d Il2CppOutputProject/IL2CPP/build ]; then
+            find Il2CppOutputProject/IL2CPP/build -type f \( ! -name '*.*' -o -name '*.dylib' \) -exec chmod +x {} +
+          fi
+
+      - name: Check bundle id, set version and build number (validated)
+        working-directory: ${{ runner.temp }}/proj
+        run: |
+          grep -Fq "PRODUCT_BUNDLE_IDENTIFIER = ${IN_BUNDLE};" Unity-iPhone.xcodeproj/project.pbxproj \
+            || grep -Fq "PRODUCT_BUNDLE_IDENTIFIER = \"${IN_BUNDLE}\";" Unity-iPhone.xcodeproj/project.pbxproj \
+            || { echo "::error::bundle id not found in Unity-iPhone.xcodeproj (wrong package?)"; exit 1; }
+          cur=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Info.plist)
+          ver=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
+          [ -n "$IN_VERSION" ] && ver="$IN_VERSION"
+          [[ "$ver" =~ ^[0-9]{1,5}(\.[0-9]{1,5}){0,2}$ ]] || { echo "::error::CFBundleShortVersionString has an invalid format"; exit 1; }
+          if [ -n "$IN_BUILD" ]; then bn="$IN_BUILD"
+          elif [[ "$cur" =~ ^[0-9]{1,6}$ ]]; then bn="$cur.$GITHUB_RUN_NUMBER"
+          else echo "::error::CFBundleVersion is not a plain number; pass build_number"; exit 1; fi
+          [[ "$bn" =~ ^[0-9]{1,9}(\.[0-9]{1,9}){0,2}$ ]] || { echo "::error::build number has an invalid format"; exit 1; }
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $ver" Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $bn" Info.plist
+          echo "BUILD_NUMBER=$bn" >> "$GITHUB_ENV"
+          echo "MARKETING_VERSION=$ver" >> "$GITHUB_ENV"
+          echo "version $ver, build $bn"
+
+      - name: CocoaPods (when the export has a Podfile)
+        working-directory: ${{ runner.temp }}/proj
+        run: |
+          if [ -f Podfile ]; then
+            pod --version
+            pod install --repo-update > "$RUNNER_TEMP/pod.log" 2>&1 || { grep -E '\[!\]|error' "$RUNNER_TEMP/pod.log" | head -20; echo "::error::pod install failed"; exit 1; }
+            tail -n 3 "$RUNNER_TEMP/pod.log"
+            test -d Unity-iPhone.xcworkspace || { echo "::error::pod install did not create Unity-iPhone.xcworkspace"; exit 1; }
+            echo "XC_KIND=workspace" >> "$GITHUB_ENV"
+          else
+            echo "::warning::no Podfile in the export (native SDKs delivered by CocoaPods would be missing)"
+            echo "XC_KIND=project" >> "$GITHUB_ENV"
+          fi
+
+      - name: Archive
+        working-directory: ${{ runner.temp }}/proj
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # The key material reaches this step only in the fallback mode sign_in_archive=true.
+          ASC_KEY_ID: ${{ inputs.sign_in_archive && secrets.ASC_KEY_ID || '' }}
+          ASC_ISSUER_ID: ${{ inputs.sign_in_archive && secrets.ASC_ISSUER_ID || '' }}
+          ASC_KEY_P8_B64: ${{ inputs.sign_in_archive && secrets.ASC_KEY_P8_B64 || '' }}
+        run: |
+          set +x
+          if [ "$XC_KIND" = workspace ]; then container=(-workspace Unity-iPhone.xcworkspace); else container=(-project Unity-iPhone.xcodeproj); fi
+          if [ "$SIGN_IN_ARCHIVE" = true ]; then
+            # Fallback path: key file exists while build scripts run (documented residual risk).
+            mkdir -p "$RUNNER_TEMP/asc"; KEY="$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8"
+            if printf '%s' "$ASC_KEY_P8_B64" | grep -q 'BEGIN PRIVATE KEY'; then printf '%s\n' "$ASC_KEY_P8_B64" > "$KEY"
+            else printf '%s' "$ASC_KEY_P8_B64" | base64 --decode > "$KEY"; fi
+            chmod 600 "$KEY"
+            while IFS= read -r l; do [ -n "$l" ] && echo "::add-mask::$l"; done < "$KEY"
+            signing=(-allowProvisioningUpdates -authenticationKeyPath "$KEY" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+                     DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic)
+          else
+            unset ASC_KEY_P8_B64 ASC_ISSUER_ID ASC_KEY_ID
+            signing=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM="$APPLE_TEAM_ID")
+          fi
+          set +e
+          xcodebuild archive "${container[@]}" -scheme "$IN_SCHEME" -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" \
+            "${signing[@]}" ENABLE_BITCODE=NO CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            > "$RUNNER_TEMP/archive.log" 2>&1
+          rc=$?
+          set -e
+          rm -rf "$RUNNER_TEMP/asc"
+          if [ $rc -ne 0 ] || [ ! -d "$ARCHIVE" ]; then
+            echo "--- error lines (max 40) ---"
+            grep -E '^(/[^ ]*|[A-Za-z0-9_./-]+):[0-9]+(:[0-9]+)?: (fatal )?error: |^error: |^xcodebuild: error: ' "$RUNNER_TEMP/archive.log" \
+              | sed -E "s#$RUNNER_TEMP/proj/##g" | cut -c1-240 | sort -u | head -40 || true
+            grep -E '^\*\* ARCHIVE (FAILED|INTERRUPTED) \*\*' "$RUNNER_TEMP/archive.log" | head -1 || true
+            echo "::error::xcodebuild archive failed (exit $rc)"; exit 1
+          fi
+          echo "archive OK"
+
+      - name: Export with cloud signing (upload to TestFlight when upload=true)
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_B64: ${{ secrets.ASC_KEY_P8_B64 }}
+        run: |
+          set +x
+          echo "::add-mask::$ASC_ISSUER_ID"
+          mkdir -p "$RUNNER_TEMP/asc"
+          KEY="$RUNNER_TEMP/asc/AuthKey_${ASC_KEY_ID}.p8"
+          trap 'rm -rf "$RUNNER_TEMP/asc"' EXIT
+          if printf '%s' "$ASC_KEY_P8_B64" | grep -q 'BEGIN PRIVATE KEY'; then printf '%s\n' "$ASC_KEY_P8_B64" > "$KEY"
+          else printf '%s' "$ASC_KEY_P8_B64" | base64 --decode > "$KEY"; fi
+          chmod 600 "$KEY"
+          while IFS= read -r l; do [ -n "$l" ] && echo "::add-mask::$l"; done < "$KEY"
+          grep -q 'BEGIN PRIVATE KEY' "$KEY" || { echo "::error::ASC_KEY_P8_B64 is not a .p8 key (raw or base64)"; exit 1; }
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>${DEST}</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          EOF
+          set +e
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE" -exportPath "$EXPORT_DIR" -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            > "$RUNNER_TEMP/export.log" 2>&1
+          rc=$?
+          set -e
+          rm -rf "$RUNNER_TEMP/asc" "$RUNNER_TEMP/ExportOptions.plist"
+          if [ $rc -ne 0 ]; then
+            echo "--- error lines (max 40) ---"
+            grep -E '^error: |^xcodebuild: error: |error: ' "$RUNNER_TEMP/export.log" | cut -c1-240 | sort -u | head -40 || true
+            echo "::error::exportArchive failed (exit $rc)"; exit 1
+          fi
+          grep -E '^\*\* EXPORT SUCCEEDED \*\*|Upload succeeded|Uploaded' "$RUNNER_TEMP/export.log" | head -3 || true
+          echo "build $MARKETING_VERSION ($BUILD_NUMBER), destination $DEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove key, project and logs (always)
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/asc" "$RUNNER_TEMP/ExportOptions.plist" "$RUNNER_TEMP/in" "$PROJ" "$RUNNER_TEMP/out" \
+                 "$RUNNER_TEMP"/*.log
+
+  cleanup:
+    needs: testflight
+    if: >-
+      always() && github.event_name == 'workflow_dispatch' &&
+      (github.triggering_actor == github.repository_owner ||
+       contains(format(',{0},', vars.IOS_CI_ALLOWED_ACTORS), format(',{0},', github.triggering_actor)))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Delete the draft release and tag (if still there)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$IN_TAG" =~ ^ci-[0-9a-f]{32}$ ]] || { echo "invalid tag, nothing to do"; exit 0; }
+          if gh release view -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft -- "$IN_TAG" >/dev/null 2>&1; then
+            gh release delete -R "$GITHUB_REPOSITORY" -y -- "$IN_TAG" && echo "release deleted"
+          else
+            echo "release already gone"
+          fi
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$IN_TAG" >/dev/null 2>&1 && echo "tag deleted" || echo "no tag"
