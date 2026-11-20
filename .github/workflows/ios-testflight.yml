@@ -82,10 +82,16 @@ jobs:
       IN_BUILD: ${{ inputs.build_number }}
       SIGN_IN_ARCHIVE: ${{ inputs.sign_in_archive && 'true' || 'false' }}
       DEST: ${{ inputs.upload && 'upload' || 'export' }}
-      PROJ: ${{ runner.temp }}/proj
-      ARCHIVE: ${{ runner.temp }}/out/App.xcarchive
-      EXPORT_DIR: ${{ runner.temp }}/out/export
+      # PROJ, ARCHIVE and EXPORT_DIR are set in the first step (the runner context is not allowed in job-level env).
     steps:
+      - name: Set work paths
+        run: |
+          {
+            echo "PROJ=$RUNNER_TEMP/proj"
+            echo "ARCHIVE=$RUNNER_TEMP/out/App.xcarchive"
+            echo "EXPORT_DIR=$RUNNER_TEMP/out/export"
+          } >> "$GITHUB_ENV"
+
       - name: Validate inputs and secrets (names only)
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
